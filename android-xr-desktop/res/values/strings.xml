@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">XR Desk</string>
+    <string name="acc_desc">XR Desk 输入服务：把手机触摸板的手势注入到眼镜屏幕上，用于点击/拖动/滚动。</string>
+</resources>
