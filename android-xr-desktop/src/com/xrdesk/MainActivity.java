@@ -26,6 +26,8 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import java.util.LinkedList;
+
 /**
  * Phone side = touchpad + control panel.
  *
@@ -33,10 +35,20 @@ import android.widget.TextView;
  * that hosts TestDesktopActivity, plus our software cursor. Clicks are injected into
  * the virtual display through XrInputService (AccessibilityService + setDisplayId).
  *
+ * Touchpad gestures (phone):
+ *   1 finger drag  -> move cursor
+ *   1 finger tap   -> click
+ *   1 finger hold  -> long press
+ *   2 finger tap   -> Back (in the app on the glasses)
+ *   2 finger up    -> Home (XR desktop / app grid)
+ *   2 finger down  -> switch to the previous app (MRU)
+ *   3 finger swipe -> cycle through launched apps
+ *
  * Can be driven from adb for verification:
  *   adb shell am broadcast -a com.xrdesk.CMD --es cmd move --ei dx 40 --ei dy -30
  *   adb shell am broadcast -a com.xrdesk.CMD --es cmd click
  *   adb shell am broadcast -a com.xrdesk.CMD --es cmd start
+ *   adb shell am broadcast -a com.xrdesk.CMD --es cmd back
  */
 public class MainActivity extends Activity {
     private static final String TAG = XrInputService.TAG;
@@ -57,6 +69,15 @@ public class MainActivity extends Activity {
     private float lastX, lastY, downX, downY;
     private long downTime;
     private boolean moved;
+
+    // multi-finger gesture bookkeeping
+    private int maxPointers;
+    private float gestureStartX, gestureStartY;
+    private boolean gestureSwiped;
+    private final float[] lastCentroid = new float[2];
+
+    // most-recently-used app packages, shared with DesktopActivity (same process)
+    static final LinkedList<String> MRU = new LinkedList<>();
 
     private TextView statusView;
     private View touchpad;
@@ -103,9 +124,11 @@ public class MainActivity extends Activity {
             else if ("desk".equals(cmd)) bringDesktop();
             else if ("click".equals(cmd)) doClick();
             else if ("long".equals(cmd)) doLongPress();
-            else if ("home".equals(cmd)) global(0);
-            else if ("back".equals(cmd)) global(1);
+            else if ("home".equals(cmd)) bringDesktop();
+            else if ("back".equals(cmd)) handleBack();
             else if ("recents".equals(cmd)) global(2);
+            else if ("prev".equals(cmd)) cycleApp(-1);
+            else if ("next".equals(cmd)) cycleApp(1);
             else if ("move".equals(cmd)) moveBy(
                     intent.getIntExtra("dx", 0), intent.getIntExtra("dy", 0));
             else if ("cursor".equals(cmd)) setCursor(
@@ -166,7 +189,7 @@ public class MainActivity extends Activity {
             public void run() { bringDesktop(); }
         }));
         row2.addView(actButton("Back", new Runnable() {
-            public void run() { global(1); }
+            public void run() { handleBack(); }
         }));
         row2.addView(actButton("点击", new Runnable() {
             public void run() { doClick(); }
@@ -184,13 +207,16 @@ public class MainActivity extends Activity {
         row3.addView(actButton("列表下翻", new Runnable() {
             public void run() { scroll(false); }
         }));
+        row3.addView(actButton("切换应用", new Runnable() {
+            public void run() { cycleApp(-1); }
+        }));
         root.addView(row3);
 
         statusView = new TextView(this);
         statusView.setTextSize(13f);
         statusView.setTextColor(Color.DKGRAY);
         statusView.setPadding(16, 16, 16, 16);
-        statusView.setText("未启动。先开无障碍，再点“启动”。");
+        statusView.setText("未启动。先开无障碍，再点“启动”。\n触摸板：单指点击/拖动，双指轻点=返回，双指上滑=桌面，双指下滑/三指滑=切应用。");
         root.addView(statusView);
 
         touchpad = new View(this);
@@ -221,31 +247,114 @@ public class MainActivity extends Activity {
     private boolean onPadTouch(MotionEvent e) {
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                lastX = e.getX();
-                lastY = e.getY();
+                lastX = e.getX(0);
+                lastY = e.getY(0);
                 downX = lastX;
                 downY = lastY;
                 downTime = SystemClock.uptimeMillis();
                 moved = false;
+                gestureSwiped = false;
+                maxPointers = 1;
+                return true;
+            case MotionEvent.ACTION_POINTER_DOWN:
+                if (maxPointers < 2) {
+                    centroid(e, lastCentroid);
+                    gestureStartX = lastCentroid[0];
+                    gestureStartY = lastCentroid[1];
+                }
+                maxPointers = Math.max(maxPointers, e.getPointerCount());
+                moved = true;                    // never treat multi-touch as a click
                 return true;
             case MotionEvent.ACTION_MOVE: {
-                float dx = e.getX() - lastX;
-                float dy = e.getY() - lastY;
-                lastX = e.getX();
-                lastY = e.getY();
-                if (Math.abs(e.getX() - downX) + Math.abs(e.getY() - downY) > 24) {
+                if (e.getPointerCount() >= 2) {
+                    centroid(e, lastCentroid);
+                    float gx = lastCentroid[0] - gestureStartX;
+                    float gy = lastCentroid[1] - gestureStartY;
+                    if (Math.abs(gx) + Math.abs(gy) > 40f) gestureSwiped = true;
+                    moved = true;
+                    return true;
+                }
+                float dx = e.getX(0) - lastX;
+                float dy = e.getY(0) - lastY;
+                lastX = e.getX(0);
+                lastY = e.getY(0);
+                if (maxPointers == 1
+                        && Math.abs(e.getX(0) - downX) + Math.abs(e.getY(0) - downY) > 24) {
                     moved = true;
                 }
-                moveBy(dx * SENSITIVITY, dy * SENSITIVITY);
+                if (maxPointers == 1) {
+                    moveBy(dx * SENSITIVITY, dy * SENSITIVITY);
+                }
                 return true;
             }
+            case MotionEvent.ACTION_POINTER_UP:
+                // Snap the end point to the centroid of the remaining pointers.
+                centroidExcept(e, e.getActionIndex(), lastCentroid);
+                return true;
             case MotionEvent.ACTION_UP:
-                if (!moved && SystemClock.uptimeMillis() - downTime < 400) {
+                if (maxPointers >= 2) {
+                    if (gestureSwiped) handleMultiGesture(maxPointers);
+                    else handleMultiTap(maxPointers);
+                } else if (!moved && SystemClock.uptimeMillis() - downTime < 400) {
                     doClick();
                 }
                 return true;
             default:
                 return true;
+        }
+    }
+
+    private static void centroid(MotionEvent e, float[] out) {
+        float sx = 0f, sy = 0f;
+        int n = e.getPointerCount();
+        for (int i = 0; i < n; i++) {
+            sx += e.getX(i);
+            sy += e.getY(i);
+        }
+        out[0] = sx / n;
+        out[1] = sy / n;
+    }
+
+    private static void centroidExcept(MotionEvent e, int skip, float[] out) {
+        float sx = 0f, sy = 0f;
+        int n = 0;
+        for (int i = 0; i < e.getPointerCount(); i++) {
+            if (i == skip) continue;
+            sx += e.getX(i);
+            sy += e.getY(i);
+            n++;
+        }
+        if (n == 0) return;
+        out[0] = sx / n;
+        out[1] = sy / n;
+    }
+
+    /** A multi-finger gesture that moved. lastCentroid holds the last movement point. */
+    private void handleMultiGesture(int fingers) {
+        float dx = lastCentroid[0] - gestureStartX;
+        float dy = lastCentroid[1] - gestureStartY;
+        float ax = Math.abs(dx), ay = Math.abs(dy);
+
+        if (fingers >= 3) {
+            cycleApp(dx < 0 ? -1 : 1);       // 3-finger swipe left/right = cycle apps
+            return;
+        }
+        // two fingers
+        if (ay >= ax) {
+            if (dy < 0) bringDesktop();      // up = Home / XR desktop
+            else cycleApp(-1);               // down = previous app
+        } else {
+            if (dx < 0) handleBack();        // left = Back
+            else bringDesktop();             // right = Home
+        }
+    }
+
+    /** A multi-finger tap (no movement). */
+    private void handleMultiTap(int fingers) {
+        if (fingers >= 3) {
+            status("三指轻点");
+        } else {
+            handleBack();                    // 2-finger tap = Back
         }
     }
 
@@ -350,11 +459,59 @@ public class MainActivity extends Activity {
         opts.setLaunchDisplayId(targetDisplayId);
         try {
             startActivity(li, opts.toBundle());
+            noteAppLaunched(pkg);
             status("已把 " + pkg + " 启动到 display=" + targetDisplayId);
         } catch (Exception e) {
             Log.e(TAG, "launchApp failed", e);
             status("启动 " + pkg + " 到眼镜屏失败: " + e.getMessage());
         }
+    }
+
+    /** Records an app launch so the touchpad can cycle back to it. Same process as DesktopActivity. */
+    static void noteAppLaunched(String pkg) {
+        if (pkg == null) return;
+        synchronized (MRU) {
+            MRU.remove(pkg);
+            MRU.addFirst(pkg);
+            while (MRU.size() > 10) MRU.removeLast();
+        }
+    }
+
+    /** Cycle to the previous (dir<0) or next (dir>0) launched app on the glasses. */
+    private void cycleApp(int dir) {
+        if (targetDisplayId < 0) {
+            status("请先点“启动”");
+            return;
+        }
+        String pkg;
+        synchronized (MRU) {
+            if (MRU.size() < 2) {
+                status("没有其他已启动应用，回到桌面");
+                bringDesktop();
+                return;
+            }
+            pkg = dir < 0 ? MRU.get(1) : MRU.get(MRU.size() - 1);
+        }
+        launchApp(pkg);
+    }
+
+    /** In-app Back on the glasses: display-targeted injection, not the phone's global back. */
+    private void handleBack() {
+        XrInputService svc = XrInputService.get();
+        if (svc == null) {
+            status("无障碍服务未开启");
+            return;
+        }
+        if (targetDisplayId < 0) {
+            status("请先点“启动”");
+            return;
+        }
+        if (targetDisplayId == Display.DEFAULT_DISPLAY) {
+            status("back(default) -> " + svc.globalBack());
+            return;
+        }
+        status("back(display=" + targetDisplayId + ") -> "
+                + svc.back(targetDisplayId, dispW, dispH));
     }
 
     private void scroll(boolean up) {

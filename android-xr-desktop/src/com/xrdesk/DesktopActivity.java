@@ -125,6 +125,7 @@ public class DesktopActivity extends Activity {
         opts.setLaunchDisplayId(getDisplay().getDisplayId());
         try {
             startActivity(li, opts.toBundle());
+            MainActivity.noteAppLaunched(e.pkg);
             Log.i(XrInputService.TAG, "desktop launch " + e.pkg
                     + " on display " + getDisplay().getDisplayId());
         } catch (Exception ex) {

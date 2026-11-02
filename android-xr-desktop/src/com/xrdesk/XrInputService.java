@@ -22,6 +22,11 @@ import android.view.accessibility.AccessibilityEvent;
  *   - draws the software cursor as an accessibility overlay on the glasses display
  *   - injects tap / long-press / swipe into a chosen display id
  *   - performs global Home/Back/Recents
+ *
+ * Per-display Back: GLOBAL_ACTION_BACK is not display-aware (it goes to the focused
+ * / default display), so for an app living on the glasses display we either tap that
+ * display's own navigation-bar Back button (if it has one) or inject an edge-back
+ * gesture targeted at the display via GestureDescription.setDisplayId().
  */
 public class XrInputService extends AccessibilityService {
     public static final String TAG = "XRDesk";
@@ -78,6 +83,48 @@ public class XrInputService extends AccessibilityService {
         p.moveTo(x1, y1);
         p.lineTo(x2, y2);
         return dispatch(displayId, new GestureDescription.StrokeDescription(p, 0, ms));
+    }
+
+    /**
+     * Back, targeted at a specific display so apps running on the glasses actually
+     * receive it. Tries the display's own navigation-bar Back button first (3-button
+     * nav), then falls back to a left-edge back gesture (gesture nav).
+     */
+    public boolean back(int displayId, int width, int height) {
+        DisplayManager dm = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+        Display d = dm == null ? null : dm.getDisplay(displayId);
+        if (d != null) {
+            try {
+                Context dc = createDisplayContext(d);
+                WindowManager w = (WindowManager) dc.getSystemService(Context.WINDOW_SERVICE);
+                android.view.WindowMetrics m = w.getCurrentWindowMetrics();
+                android.graphics.Insets nb = m.getWindowInsets()
+                        .getInsets(android.view.WindowInsets.Type.navigationBars());
+                if (nb.bottom > 0) {
+                    // 3 equal buttons: Back is the leftmost, center ~ width/6.
+                    float x = width / 6f;
+                    float y = height - nb.bottom / 2f;
+                    Log.i(TAG, "back: nav-bar tap at " + x + "," + y + " inset=" + nb.bottom);
+                    if (tap(displayId, x, y)) return true;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "back: nav-bar probe failed: " + e);
+            }
+        }
+        // Gesture navigation: swipe inward from the left edge.
+        Path p = new Path();
+        p.moveTo(2f, height / 2f);
+        p.lineTo(Math.max(width * 0.30f, 2f), height / 2f);
+        Log.i(TAG, "back: edge gesture on display=" + displayId);
+        return dispatch(displayId, new GestureDescription.StrokeDescription(p, 0, 200));
+    }
+
+    /** Home, targeted at a display (bottom-edge swipe up, i.e. gesture nav). */
+    public boolean home(int displayId, int width, int height) {
+        Path p = new Path();
+        p.moveTo(width / 2f, height - 2f);
+        p.lineTo(width / 2f, height * 0.35f);
+        return dispatch(displayId, new GestureDescription.StrokeDescription(p, 0, 260));
     }
 
     private boolean dispatch(int displayId, GestureDescription.StrokeDescription stroke) {
